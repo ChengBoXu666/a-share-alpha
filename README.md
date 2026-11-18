@@ -22,7 +22,7 @@ uv run python scripts/01_download.py --limit 20 # 试跑下载
 uv run pytest -q                                # 跑测试
 ```
 
-## 已知局限（诚实写出来是加分项）
+## 已知局限
 
 - 行业分类用的是当前行业，不是历史时点行业
 - 流通市值由 成交量/换手率 反推，是近似值
