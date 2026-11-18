@@ -3,7 +3,7 @@ Stage 1 · 下载 A 股日线原始数据（BaoStock：免费、无需注册、�
 
 用法（在项目根目录执行）:
     uv run python scripts/01_download.py --limit 20     # 先试跑 20 只，确认没问题
-    uv run python scripts/01_download.py                # 全量，约 5000+ 只，1~3 小时，可断点续传
+    uv run python scripts/01_download.py                # 全量，约 5000+ 只，耗时取决于网络（几小时），可断点续传
 
 设计要点（面试会问，务必理解）:
 1. 股票列表包含【已退市】股票 —— 只用今天还活着的股票做回测 = 幸存者偏差，回测会虚高。
@@ -11,10 +11,13 @@ Stage 1 · 下载 A 股日线原始数据（BaoStock：免费、无需注册、�
    - 收益率 ret = close / preclose - 1 天然已经处理了分红送转，不需要复权因子；
    - 涨跌停判断必须用不复权的真实价格（涨停价 = 前收 × 1.1 四舍五入到分）。
 3. 每只股票存一个 parquet，已存在就跳过 → 断点续传，中途断网重跑即可。
+4. 多进程并行下载（--workers，默认 4）；网络请求设 60 秒超时，卡住会自动重试而不是一直挂着。
 """
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
+import socket
 import time
 from datetime import date
 from pathlib import Path
@@ -76,11 +79,44 @@ def download_one(code: str, start: str, end: str) -> pd.DataFrame:
     if df.empty:
         return df
     for c in FLOAT_COLS:
-        df[c] = pd.to_numeric(df[c], errors="coerce")  # 空字符串 → NaN
+        # 空字符串 → NaN；必须显式转 float64：否则某只股票 volume 全是整数时会被推断成 int64，
+        # 另一只有空值的是 float64，各文件列类型不一致，合并读取时报 SchemaError
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
     for c in INT_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int8")
     df["date"] = pd.to_datetime(df["date"])
     return df
+
+
+def _init_worker() -> None:
+    """每个下载进程各自登录一次。超时设置让"卡死"变成"报错后重试"。"""
+    socket.setdefaulttimeout(60)
+    bs.login()
+
+
+def _fetch(task: tuple[str, str, str]) -> tuple[str, str]:
+    """下载并保存一只股票。返回 (code, 状态)：ok / empty / 错误信息"""
+    code, start, end = task
+    out = RAW_DIR / f"{code}.parquet"
+    err = ""
+    for _ in range(3):
+        try:
+            df = download_one(code, start, end)
+            if df.empty:
+                return code, "empty"
+            tmp = out.with_suffix(".tmp")  # 先写临时文件再改名：不会留下写了一半的 parquet
+            df.to_parquet(tmp, index=False)
+            tmp.replace(out)
+            return code, "ok"
+        except Exception as e:  # 网络抖动 / 超时：重新登录后重试
+            err = repr(e)
+            time.sleep(2)
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            bs.login()
+    return code, err
 
 
 def main() -> None:
@@ -88,42 +124,45 @@ def main() -> None:
     ap.add_argument("--start", default="2014-01-01", help="留出约 1 年给因子计算的回看窗口")
     ap.add_argument("--end", default=date.today().isoformat())
     ap.add_argument("--limit", type=int, default=None, help="只下载前 N 只（试跑用）")
+    ap.add_argument("--workers", type=int, default=4, help="并行下载的进程数")
     args = ap.parse_args()
 
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+    socket.setdefaulttimeout(60)
     lg = bs.login()
     if lg.error_code != "0":
         raise SystemExit(f"登录失败: {lg.error_msg}")
-
     try:
         basic = download_meta(args.start, args.end)
-        start_ts, end_ts = pd.Timestamp(args.start), pd.Timestamp(args.end)
-        # 只保留和下载区间有交集的股票：上市早于 end，且（未退市 或 退市晚于 start）
-        alive = basic[(basic["ipo_date"] <= end_ts) &
-                      (basic["out_date"].isna() | (basic["out_date"] >= start_ts))]
-        codes = alive["code"].tolist()[: args.limit]
-
-        failed = []
-        for code in tqdm(codes, desc="下载日线"):
-            out = RAW_DIR / f"{code}.parquet"
-            if out.exists():
-                continue  # 断点续传
-            for attempt in range(3):
-                try:
-                    df = download_one(code, args.start, args.end)
-                    df.to_parquet(out, index=False)  # 空表也写，标记"已处理"
-                    break
-                except Exception as e:  # 网络抖动：重新登录后重试
-                    if attempt == 2:
-                        failed.append((code, repr(e)))
-                    time.sleep(2)
-                    bs.logout()
-                    bs.login()
-        if failed:
-            print(f"失败 {len(failed)} 只，重跑脚本即可补齐: {failed[:5]} ...")
-        print("完成 ✅")
     finally:
         bs.logout()
+
+    start_ts, end_ts = pd.Timestamp(args.start), pd.Timestamp(args.end)
+    # 只保留和下载区间有交集的股票：上市早于 end，且（未退市 或 退市晚于 start）
+    alive = basic[(basic["ipo_date"] <= end_ts) &
+                  (basic["out_date"].isna() | (basic["out_date"] >= start_ts))]
+    codes = alive["code"].tolist()[: args.limit]
+
+    no_data_file = META_DIR / "no_data_codes.txt"
+    no_data = set(no_data_file.read_text().split()) if no_data_file.exists() else set()
+    # 断点续传：已有文件的、已知没数据的都跳过
+    todo = [c for c in codes if c not in no_data and not (RAW_DIR / f"{c}.parquet").exists()]
+    print(f"共 {len(codes)} 只，已完成 {len(codes) - len(todo)} 只，本次下载 {len(todo)} 只，{args.workers} 个进程")
+
+    failed = []
+    tasks = [(c, args.start, args.end) for c in todo]
+    with mp.Pool(args.workers, initializer=_init_worker) as pool:
+        for code, status in tqdm(pool.imap_unordered(_fetch, tasks), total=len(tasks), desc="下载日线"):
+            if status == "empty":
+                with no_data_file.open("a") as f:
+                    f.write(code + "\n")
+            elif status != "ok":
+                failed.append((code, status))
+
+    if failed:
+        print(f"失败 {len(failed)} 只，重跑脚本即可补齐: {failed[:5]} ...")
+    else:
+        print("完成 ✅")
 
 
 if __name__ == "__main__":

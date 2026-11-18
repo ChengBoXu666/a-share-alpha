@@ -25,6 +25,13 @@ def add_board(df: pl.DataFrame) -> pl.DataFrame:
     - 其余为主板 main
     """
     # TODO
+    is_star = pl.col("code").str.starts_with("sh.688") | pl.col("code").str.starts_with("sh.689")
+    is_gem = pl.col("code").str.starts_with("sz.300") | pl.col("code").str.starts_with("sz.301")
+    return df.with_columns(
+        board=pl.when(is_star).then(pl.lit("star"))
+        .when(is_gem).then(pl.lit("gem"))
+        .otherwise(pl.lit("main"))
+    )
     raise NotImplementedError
 
 
@@ -36,6 +43,7 @@ def add_status(df: pl.DataFrame) -> pl.DataFrame:
         turn <= 0 或为空时 float_mv 为 null
     """
     # TODO
+    df.with_columns
     raise NotImplementedError
 
 
