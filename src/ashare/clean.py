@@ -24,7 +24,6 @@ def add_board(df: pl.DataFrame) -> pl.DataFrame:
     - 创业板 gem : 代码以 sz.300 / sz.301 开头
     - 其余为主板 main
     """
-    # TODO
     is_star = pl.col("code").str.starts_with("sh.688") | pl.col("code").str.starts_with("sh.689")
     is_gem = pl.col("code").str.starts_with("sz.300") | pl.col("code").str.starts_with("sz.301")
     return df.with_columns(
@@ -42,8 +41,11 @@ def add_status(df: pl.DataFrame) -> pl.DataFrame:
         （turn 是换手率%，= 成交量/流通股本×100，所以 流通股本 = volume / (turn/100)）
         turn <= 0 或为空时 float_mv 为 null
     """
-    # TODO
-    df.with_columns
+    return df.with_columns(
+        is_suspended=(pl.col("tradestatus")==0) | (pl.col("volume")==0),
+        float_mv=pl.when(pl.col("turn")>0).then(pl.col("close")*pl.col("volume")*100/pl.col("turn"))
+    )
+
     raise NotImplementedError
 
 
@@ -59,7 +61,18 @@ def add_limit_flags(df: pl.DataFrame) -> pl.DataFrame:
     - limit_up (bool):   volume > 0 且 close >= up_price - 1e-6
     - limit_down (bool): volume > 0 且 close <= down_price + 1e-6
     """
-    # TODO
+    return df.with_columns(
+        limit_pct= pl.when((pl.col("board")=="star")|((pl.col("board")=="gem")&(pl.col("date")>=GEM_REFORM_DATE))).then(0.2) 
+                   .when((pl.col("board")=="main")&(pl.col("is_st") == 0)).then(0.1)
+                   .when((pl.col("board")=="gem") & (pl.col("is_st")==0)).then(0.1)
+                   .otherwise(0.05)
+    ).with_columns(
+        up_price= (pl.col("preclose")*(1+pl.col("limit_pct"))*100+0.5+1e-6).floor()/100,
+        down_price= (pl.col("preclose")*(1-pl.col("limit_pct"))*100+0.5+1e-6).floor()/100
+    ).with_columns(
+        limit_up= ((pl.col("volume")>0)&(pl.col("close")>=pl.col("up_price")-1e-6)),
+        limit_down= ((pl.col("volume")>0)&(pl.col("close")<=pl.col("down_price")+1e-6)),
+    )
     raise NotImplementedError
 
 
@@ -69,7 +82,11 @@ def add_returns(df: pl.DataFrame) -> pl.DataFrame:
     - adj_close: 每只股票按日期排序后，(1 + ret) 的累乘 —— 相当于"后复权价格指数"
     要求: 输入行顺序可能是乱的，函数内部要先按 (code, date) 排序；输出也按 (code, date) 排序
     """
-    # TODO
+    return df.with_columns(
+        ret=pl.col("close")/pl.col("preclose")-1
+    ).sort("code","date").with_columns(
+        adj_close=(1+pl.col("ret")).cum_prod().over("code")
+    )
     raise NotImplementedError
 
 
@@ -77,7 +94,9 @@ def add_list_days(df: pl.DataFrame, basic: pl.DataFrame) -> pl.DataFrame:
     """basic 有列 code, ipo_date (pl.Date)
     新增列 list_days: date 与 ipo_date 之间的自然日天数（int）
     """
-    # TODO
+    return(df.join(basic,on="code",how="left")
+           .with_columns(list_days=(pl.col("date")-pl.col("ipo_date")).dt.total_days())
+    )
     raise NotImplementedError
 
 
@@ -86,6 +105,9 @@ def add_universe(df: pl.DataFrame, min_list_days: int = 180) -> pl.DataFrame:
     —— 这就是"当天可以被我们选入组合的股票池"
     """
     # TODO
+    return df.with_columns(
+        in_universe=(pl.col("is_st")==0)&(pl.col("is_suspended")==0)& (pl.col("list_days")>=min_list_days)
+    )
     raise NotImplementedError
 
 
@@ -98,8 +120,59 @@ def build_panel(raw_dir: str | Path = "data/raw/daily",
     3. 依次调用 add_board → add_status → add_limit_flags → add_returns → add_list_days → add_universe
     4. 写出 out_path，打印行数、股票数、日期范围、每年平均 in_universe 股票数，做 sanity check
     """
-    # TODO
-    raise NotImplementedError
+    # 1. 读取全部原始日线。scan = 懒加载，collect 时才真正读；date 去掉时分秒转成 pl.Date
+    raw = (
+        pl.scan_parquet(f"{raw_dir}/*.parquet")
+        .with_columns(pl.col("date").cast(pl.Date))
+        .collect()
+    )
+
+    # 2. 股票列表（上市日期）
+    basic = (
+        pl.read_parquet(f"{meta_dir}/stock_basic.parquet")
+        .with_columns(pl.col("ipo_date").cast(pl.Date))
+    )
+
+    # 3. 流水线：df.pipe(f, x) 等价于 f(df, x)。顺序有依赖，不能随意调换
+    panel = (
+        raw.pipe(add_board)
+        .pipe(add_status)
+        .pipe(add_limit_flags)   # 需要 board
+        .pipe(add_returns)       # 会按 (code, date) 排序
+        .pipe(add_list_days, basic)
+        .pipe(add_universe)      # 需要 is_suspended、list_days
+    )
+
+    # 4. 保存
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    panel.write_parquet(out_path)
+
+    # 5. sanity check：这些数字不合理，说明前面有 bug
+    print(f"行数: {panel.height:,}")
+    print(f"股票数: {panel['code'].n_unique():,}")
+    print(f"日期范围: {panel['date'].min()} ~ {panel['date'].max()}")
+    print(f"ret 为空的行数: {panel['ret'].null_count():,}")
+
+    daily = panel.group_by("date").agg(
+        n_universe=pl.col("in_universe").sum(),
+        n_limit_up=pl.col("limit_up").sum(),
+        n_limit_down=pl.col("limit_down").sum(),
+    )
+    yearly = (
+        daily.group_by(pl.col("date").dt.year().alias("year"))
+        .agg(
+            avg_universe=pl.col("n_universe").mean().round(0),
+            max_limit_up=pl.col("n_limit_up").max(),
+            max_limit_down=pl.col("n_limit_down").max(),
+        )
+        .sort("year")
+    )
+    print("每年：平均每天股票池数量 / 单日最多涨停数 / 单日最多跌停数")
+    with pl.Config(tbl_rows=20):
+        print(yearly)
+
+    return panel
 
 
 if __name__ == "__main__":
